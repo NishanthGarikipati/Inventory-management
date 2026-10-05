@@ -1,0 +1,17 @@
+ABC DISTRIBUTORS
+SHOP 14, MARKET ROAD, PUNE
+GSTIN: 27AABCU9603R1ZM
+TAX INVOICE
+INVOICE NO: INV-12345
+DATE: 16/09/2026
+
+ITEM              QTY   RATE   AMOUNT
+-----------------------------------
+RICE 5KG          20    300    6000
+SUGAR 1KG         30    45     1350
+SUNFLOWER OIL 1L  15    110    1650
+TOOR DAL 1KG      10    140    1400
+-----------------------------------
+SUB TOTAL                    10400
+GST 5%                         520
+TOTAL                        10920

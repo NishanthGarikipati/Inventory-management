@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Dukaan">
+  <rect width="512" height="512" rx="112" fill="#0f766e" />
+  <path d="M112 196 L152 116 H360 L400 196 Z" fill="#f8fafc" />
+  <path d="M136 208 H376 V396 H136 Z" fill="#ccfbf1" />
+  <path d="M176 396 V300 H256 V396 Z" fill="#0f766e" />
+  <rect x="288" y="300" width="72" height="56" rx="8" fill="#0f766e" />
+</svg>

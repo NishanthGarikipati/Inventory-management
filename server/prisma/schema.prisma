@@ -1,0 +1,1136 @@
+// Dukaan - inventory & business management for small businesses.
+//
+// Conventions used across the whole schema:
+//   * Money is stored as an integer number of paise (1 rupee = 100 paise).
+//     Never use floating point for money.
+//   * Quantity is a float rounded to 3 decimals (supports 0.250 kg etc).
+//   * Every business-owned row carries `businessId`. The repository layer
+//     refuses to build a query without it (see src/db/tenant.ts).
+//   * Enum-ish columns are plain strings because SQLite has no enums; the
+//     allowed values live in src/domain/enums.ts and are validated by zod.
+//
+// The datasource is SQLite for local/offline-friendly deployments; the schema
+// deliberately avoids provider specific features so the same models can be
+// pushed to PostgreSQL for multi-store/cloud deployments.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy, identity and access control
+// ---------------------------------------------------------------------------
+
+model Business {
+  id            String   @id @default(cuid())
+  name          String
+  ownerName     String
+  phone         String
+  email         String?
+  address       String?
+  gstin         String?
+  logoRef       String?
+  businessType  String // BusinessTypeCode
+  currency      String   @default("INR")
+  country       String   @default("IN")
+  timezone      String   @default("Asia/Kolkata")
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  settings            BusinessSettings?
+  users               User[]
+  products            Product[]
+  variants            ProductVariant[]
+  categories          Category[]
+  brands              Brand[]
+  units               Unit[]
+  unitConversions     UnitConversion[]
+  attributeDefs       ProductAttributeDefinition[]
+  attributeValues     ProductAttributeValue[]
+  customers           Customer[]
+  suppliers           Supplier[]
+  sales               Sale[]
+  purchases           Purchase[]
+  inventory           Inventory[]
+  inventoryTxns       InventoryTransaction[]
+  stockAdjustments    StockAdjustment[]
+  customerPayments    CustomerPayment[]
+  supplierPayments    SupplierPayment[]
+  salesReturns        SalesReturn[]
+  purchaseReturns     PurchaseReturn[]
+  expenses            Expense[]
+  expenseCategories   ExpenseCategory[]
+  taxes               Tax[]
+  invoices            Invoice[]
+  notifications       Notification[]
+  auditLogs           AuditLog[]
+  imageScans          ImageScan[]
+  recipes             Recipe[]
+  productions         Production[]
+  wastages            Wastage[]
+  batches             Batch[]
+  serialItems         SerialItem[]
+  dailyClosings       DailyClosing[]
+  sequences           DocumentSequence[]
+  idempotencyKeys     IdempotencyKey[]
+
+  @@index([businessType])
+}
+
+model BusinessSettings {
+  id                   String  @id @default(cuid())
+  businessId           String  @unique
+  business             Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  // Tax
+  taxEnabled           Boolean @default(true)
+  pricesIncludeTax     Boolean @default(true)
+  defaultTaxRate       Float   @default(0)
+  taxLabel             String  @default("GST")
+  // Selling behaviour
+  allowNegativeStock   Boolean @default(false)
+  roundOffSaleTotal    Boolean @default(true)
+  lowStockAlerts       Boolean @default(true)
+  expiryAlertDays      Int     @default(30)
+  // Feature flags resolved from the business type but user-overridable
+  featureOverrides     String  @default("{}") // JSON map<featureKey, boolean>
+  // Scanner thresholds (0..1)
+  confidenceHigh       Float   @default(0.9)
+  confidenceMedium     Float   @default(0.7)
+  invoicePrefix        String  @default("INV")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+/// Catalogue of supported industries. Seeded globally (not tenant scoped).
+model BusinessType {
+  code        String  @id
+  name        String
+  description String
+  icon        String
+  /// JSON: { features: string[], attributes: AttributeDef[], units: string[], sampleCategories: string[] }
+  config      String
+  sortOrder   Int     @default(0)
+}
+
+model User {
+  id           String   @id @default(cuid())
+  businessId   String
+  business     Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name         String
+  phone        String
+  email        String?
+  pinHash      String
+  role         String // OWNER | MANAGER | CASHIER
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sales            Sale[]
+  purchases        Purchase[]
+  inventoryTxns    InventoryTransaction[]
+  auditLogs        AuditLog[]
+  imageScans       ImageScan[]
+  approvals        ImageScanApproval[]
+  dailyClosings    DailyClosing[]
+  refreshTokens    RefreshToken[]
+
+  @@unique([businessId, phone])
+  @@index([businessId])
+}
+
+model RefreshToken {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+}
+
+/// Seeded global role catalogue; the effective permission matrix lives in
+/// src/domain/permissions.ts and is mirrored here for introspection/UI.
+model Role {
+  code        String           @id
+  name        String
+  description String
+  permissions RolePermission[]
+}
+
+model Permission {
+  code        String           @id
+  description String
+  module      String
+  roles       RolePermission[]
+}
+
+model RolePermission {
+  roleCode       String
+  permissionCode String
+  role           Role       @relation(fields: [roleCode], references: [code], onDelete: Cascade)
+  permission     Permission @relation(fields: [permissionCode], references: [code], onDelete: Cascade)
+
+  @@id([roleCode, permissionCode])
+}
+
+// ---------------------------------------------------------------------------
+// Catalogue
+// ---------------------------------------------------------------------------
+
+model Category {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name       String
+  parentId   String?
+  parent     Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children   Category[] @relation("CategoryTree")
+  products   Product[]
+  createdAt  DateTime @default(now())
+
+  @@unique([businessId, name])
+  @@index([businessId])
+}
+
+model Brand {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name       String
+  products   Product[]
+  createdAt  DateTime @default(now())
+
+  @@unique([businessId, name])
+  @@index([businessId])
+}
+
+model Unit {
+  id           String   @id @default(cuid())
+  businessId   String
+  business     Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  code         String // PCS, KG, G, L, ML, BOX...
+  name         String
+  allowDecimal Boolean  @default(false)
+  isBase       Boolean  @default(true)
+  products     Product[]
+  fromConversions UnitConversion[] @relation("FromUnit")
+  toConversions   UnitConversion[] @relation("ToUnit")
+
+  @@unique([businessId, code])
+  @@index([businessId])
+}
+
+model UnitConversion {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  fromUnitId String
+  fromUnit   Unit     @relation("FromUnit", fields: [fromUnitId], references: [id], onDelete: Cascade)
+  toUnitId   String
+  toUnit     Unit     @relation("ToUnit", fields: [toUnitId], references: [id], onDelete: Cascade)
+  /// 1 fromUnit = factor toUnit (1 BOX = 100 PCS -> factor 100)
+  factor     Float
+  productId  String?
+  product    Product? @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, fromUnitId, toUnitId, productId])
+  @@index([businessId])
+}
+
+model Tax {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name       String // GST 5%
+  rate       Float // percentage
+  isDefault  Boolean  @default(false)
+  products   Product[]
+
+  @@unique([businessId, name])
+  @@index([businessId])
+}
+
+model Product {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name          String
+  normalizedName String // lowercase, punctuation stripped - used for matching
+  description   String?
+  categoryId    String?
+  category      Category? @relation(fields: [categoryId], references: [id])
+  brandId       String?
+  brand         Brand?   @relation(fields: [brandId], references: [id])
+  unitId        String
+  unit          Unit     @relation(fields: [unitId], references: [id])
+  taxId         String?
+  tax           Tax?     @relation(fields: [taxId], references: [id])
+  supplierId    String?
+  supplier      Supplier? @relation(fields: [supplierId], references: [id])
+  imageRef      String?
+  hasVariants   Boolean  @default(false)
+  trackBatch    Boolean  @default(false)
+  trackExpiry   Boolean  @default(false)
+  trackSerial   Boolean  @default(false)
+  isService     Boolean  @default(false)
+  /// Composite item (menu item / bakery product) assembled from a recipe.
+  isComposite   Boolean  @default(false)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  variants        ProductVariant[]
+  attributeValues ProductAttributeValue[]
+  unitConversions UnitConversion[]
+  recipes         Recipe[]
+  recipeItems     RecipeItem[]
+
+  @@index([businessId, isActive])
+  @@index([businessId, normalizedName])
+  @@index([businessId, categoryId])
+}
+
+/// Every product has at least one variant (the "default" one). Stock, price
+/// and barcodes always live on the variant so the rest of the system has a
+/// single stock-keeping unit concept.
+model ProductVariant {
+  id             String   @id @default(cuid())
+  businessId     String
+  business       Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  productId      String
+  product        Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name           String   @default("Default")
+  sku            String
+  barcode        String?
+  /// JSON map of variant option values e.g. {"Size":"M","Color":"Red"}
+  options        String   @default("{}")
+  purchasePricePaise Int  @default(0)
+  sellingPricePaise  Int  @default(0)
+  mrpPaise           Int  @default(0)
+  minStock       Float    @default(0)
+  isDefault      Boolean  @default(true)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  inventory        Inventory?
+  inventoryTxns    InventoryTransaction[]
+  saleItems        SaleItem[]
+  purchaseItems    PurchaseItem[]
+  adjustmentItems  StockAdjustmentItem[]
+  salesReturnItems SalesReturnItem[]
+  purchaseReturnItems PurchaseReturnItem[]
+  batches          Batch[]
+  serialItems      SerialItem[]
+  scanItems        ImageScanItem[]
+  recipeItems      RecipeItem[]
+  productionItems  ProductionItem[]
+  wastages         Wastage[]
+
+  @@unique([businessId, sku])
+  @@unique([businessId, barcode])
+  @@index([businessId, productId])
+}
+
+/// Attribute definitions come from the business type template but can be
+/// extended per business (the "Product Attribute Engine").
+model ProductAttributeDefinition {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  key           String
+  label         String
+  dataType      String // TEXT | NUMBER | DATE | SELECT | BOOLEAN
+  options       String   @default("[]") // JSON array for SELECT
+  isRequired    Boolean  @default(false)
+  showInList    Boolean  @default(false)
+  appliesToVariant Boolean @default(false)
+  sortOrder     Int      @default(0)
+  values        ProductAttributeValue[]
+
+  @@unique([businessId, key])
+  @@index([businessId])
+}
+
+model ProductAttributeValue {
+  id           String   @id @default(cuid())
+  businessId   String
+  business     Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  productId    String
+  product      Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  definitionId String
+  definition   ProductAttributeDefinition @relation(fields: [definitionId], references: [id], onDelete: Cascade)
+  value        String
+
+  @@unique([productId, definitionId])
+  @@index([businessId])
+}
+
+// ---------------------------------------------------------------------------
+// Parties
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name          String
+  phone         String?
+  email         String?
+  address       String?
+  gstin         String?
+  creditLimitPaise Int   @default(0)
+  /// Positive = customer owes the shop.
+  balancePaise  Int      @default(0)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  sales         Sale[]
+  payments      CustomerPayment[]
+  salesReturns  SalesReturn[]
+
+  @@unique([businessId, phone])
+  @@index([businessId, name])
+}
+
+model Supplier {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name          String
+  normalizedName String  @default("")
+  phone         String?
+  email         String?
+  address       String?
+  gstin         String?
+  /// Positive = shop owes the supplier.
+  balancePaise  Int      @default(0)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  products        Product[]
+  purchases       Purchase[]
+  payments        SupplierPayment[]
+  purchaseReturns PurchaseReturn[]
+  imageScans      ImageScan[]
+
+  @@unique([businessId, phone])
+  @@index([businessId, name])
+}
+
+// ---------------------------------------------------------------------------
+// Inventory
+// ---------------------------------------------------------------------------
+
+model Inventory {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  variantId     String   @unique
+  variant       ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  quantity      Float    @default(0)
+  /// Moving average cost used for COGS/profit.
+  avgCostPaise  Int      @default(0)
+  updatedAt     DateTime @updatedAt
+
+  @@index([businessId])
+}
+
+model InventoryTransaction {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  variantId     String
+  variant       ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  batchId       String?
+  batch         Batch?   @relation(fields: [batchId], references: [id])
+  type          String // OPENING | PURCHASE | SALE | SALE_RETURN | PURCHASE_RETURN | ADJUSTMENT | DAMAGE | EXPIRY | TRANSFER | PRODUCTION | CONSUMPTION | IMAGE_SCAN_ADJUSTMENT
+  /// Signed quantity: positive increases stock, negative decreases it.
+  quantity      Float
+  previousStock Float
+  newStock      Float
+  unitCostPaise Int      @default(0)
+  referenceType String? // SALE | PURCHASE | ADJUSTMENT | ...
+  referenceId   String?
+  /// MANUAL | BARCODE | IMAGE_SCAN | SYSTEM | IMPORT
+  source        String   @default("MANUAL")
+  note          String?
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id])
+  createdAt     DateTime @default(now())
+
+  @@index([businessId, variantId, createdAt])
+  @@index([businessId, type])
+  @@index([businessId, referenceType, referenceId])
+}
+
+model Batch {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  variantId     String
+  variant       ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  batchNumber   String
+  expiryDate    DateTime?
+  mfgDate       DateTime?
+  quantity      Float    @default(0)
+  costPaise     Int      @default(0)
+  mrpPaise      Int      @default(0)
+  createdAt     DateTime @default(now())
+
+  transactions  InventoryTransaction[]
+  saleItems     SaleItem[]
+  purchaseItems PurchaseItem[]
+
+  @@unique([businessId, variantId, batchNumber])
+  @@index([businessId, expiryDate])
+}
+
+model SerialItem {
+  id          String   @id @default(cuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  serial      String
+  imei        String?
+  status      String   @default("IN_STOCK") // IN_STOCK | SOLD | RETURNED | DAMAGED
+  purchaseId  String?
+  saleId      String?
+  warrantyMonths Int?
+  soldAt      DateTime?
+  createdAt   DateTime @default(now())
+
+  @@unique([businessId, serial])
+  @@index([businessId, variantId, status])
+}
+
+model StockAdjustment {
+  id          String   @id @default(cuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  reason      String // DAMAGED | EXPIRED | LOST | PERSONAL_USE | COUNT_DIFF | OPENING | OTHER
+  note        String?
+  source      String   @default("MANUAL")
+  userId      String?
+  createdAt   DateTime @default(now())
+  items       StockAdjustmentItem[]
+
+  @@index([businessId, createdAt])
+}
+
+model StockAdjustmentItem {
+  id             String  @id @default(cuid())
+  adjustmentId   String
+  adjustment     StockAdjustment @relation(fields: [adjustmentId], references: [id], onDelete: Cascade)
+  variantId      String
+  variant        ProductVariant @relation(fields: [variantId], references: [id])
+  /// Signed change applied to stock.
+  quantityChange Float
+  previousStock  Float
+  newStock       Float
+
+  @@index([adjustmentId])
+}
+
+// ---------------------------------------------------------------------------
+// Sales
+// ---------------------------------------------------------------------------
+
+model Sale {
+  id               String   @id @default(cuid())
+  businessId       String
+  business         Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  invoiceNumber    String
+  customerId       String?
+  customer         Customer? @relation(fields: [customerId], references: [id])
+  userId           String?
+  user             User?    @relation(fields: [userId], references: [id])
+  saleDate         DateTime @default(now())
+  subtotalPaise    Int      @default(0)
+  discountPaise    Int      @default(0)
+  taxPaise         Int      @default(0)
+  roundOffPaise    Int      @default(0)
+  totalPaise       Int      @default(0)
+  paidPaise        Int      @default(0)
+  duePaise         Int      @default(0)
+  cogsPaise        Int      @default(0)
+  grossProfitPaise Int      @default(0)
+  status           String   @default("COMPLETED") // COMPLETED | CANCELLED
+  channel          String   @default("COUNTER") // COUNTER | TAKEAWAY | DELIVERY | TABLE
+  tableLabel       String?
+  note             String?
+  clientRequestId  String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  items    SaleItem[]
+  payments SalePayment[]
+  returns  SalesReturn[]
+  invoice  Invoice?
+
+  @@unique([businessId, invoiceNumber])
+  @@index([businessId, saleDate])
+  @@index([businessId, customerId])
+}
+
+model SaleItem {
+  id             String  @id @default(cuid())
+  saleId         String
+  sale           Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  variantId      String
+  variant        ProductVariant @relation(fields: [variantId], references: [id])
+  batchId        String?
+  batch          Batch?  @relation(fields: [batchId], references: [id])
+  productName    String
+  quantity       Float
+  unitPricePaise Int
+  discountPaise  Int     @default(0)
+  taxRate        Float   @default(0)
+  taxPaise       Int     @default(0)
+  totalPaise     Int
+  costPaise      Int     @default(0) // COGS for this line
+  returnedQty    Float   @default(0)
+
+  returnItems SalesReturnItem[]
+
+  @@index([saleId])
+  @@index([variantId])
+}
+
+model SalePayment {
+  id          String   @id @default(cuid())
+  saleId      String
+  sale        Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  method      String // CASH | UPI | CARD | CREDIT | OTHER
+  amountPaise Int
+  reference   String?
+  createdAt   DateTime @default(now())
+
+  @@index([saleId])
+}
+
+model Invoice {
+  id          String   @id @default(cuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  saleId      String   @unique
+  sale        Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  number      String
+  /// Rendered receipt snapshot (JSON) so reprints never change historically.
+  payload     String
+  createdAt   DateTime @default(now())
+
+  @@index([businessId])
+}
+
+model CustomerPayment {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customerId    String
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  amountPaise   Int
+  method        String   @default("CASH")
+  reference     String?
+  note          String?
+  saleId        String?
+  balanceAfterPaise Int  @default(0)
+  userId        String?
+  createdAt     DateTime @default(now())
+
+  @@index([businessId, customerId])
+}
+
+model SalesReturn {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  saleId        String?
+  sale          Sale?    @relation(fields: [saleId], references: [id])
+  customerId    String?
+  customer      Customer? @relation(fields: [customerId], references: [id])
+  returnNumber  String
+  reason        String
+  totalPaise    Int      @default(0)
+  refundMethod  String   @default("CASH") // CASH | UPI | CARD | CREDIT_NOTE | ADJUST_DUE
+  refundPaise   Int      @default(0)
+  userId        String?
+  createdAt     DateTime @default(now())
+
+  items SalesReturnItem[]
+
+  @@unique([businessId, returnNumber])
+  @@index([businessId, createdAt])
+}
+
+model SalesReturnItem {
+  id             String  @id @default(cuid())
+  returnId       String
+  salesReturn    SalesReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  saleItemId     String?
+  saleItem       SaleItem? @relation(fields: [saleItemId], references: [id])
+  variantId      String
+  variant        ProductVariant @relation(fields: [variantId], references: [id])
+  quantity       Float
+  unitPricePaise Int
+  totalPaise     Int
+  restock        Boolean @default(true)
+
+  @@index([returnId])
+}
+
+// ---------------------------------------------------------------------------
+// Purchases
+// ---------------------------------------------------------------------------
+
+model Purchase {
+  id              String   @id @default(cuid())
+  businessId      String
+  business        Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  supplierId      String?
+  supplier        Supplier? @relation(fields: [supplierId], references: [id])
+  userId          String?
+  user            User?    @relation(fields: [userId], references: [id])
+  invoiceNumber   String?
+  purchaseDate    DateTime @default(now())
+  subtotalPaise   Int      @default(0)
+  discountPaise   Int      @default(0)
+  taxPaise        Int      @default(0)
+  totalPaise      Int      @default(0)
+  paidPaise       Int      @default(0)
+  duePaise        Int      @default(0)
+  status          String   @default("COMPLETED") // COMPLETED | CANCELLED
+  source          String   @default("MANUAL") // MANUAL | BARCODE | IMAGE_SCAN
+  imageScanId     String?
+  note            String?
+  clientRequestId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  items    PurchaseItem[]
+  payments PurchasePayment[]
+  returns  PurchaseReturn[]
+
+  @@index([businessId, purchaseDate])
+  @@index([businessId, supplierId])
+}
+
+model PurchaseItem {
+  id             String  @id @default(cuid())
+  purchaseId     String
+  purchase       Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  variantId      String
+  variant        ProductVariant @relation(fields: [variantId], references: [id])
+  batchId        String?
+  batch          Batch?  @relation(fields: [batchId], references: [id])
+  productName    String
+  quantity       Float
+  unitCostPaise  Int
+  discountPaise  Int     @default(0)
+  taxRate        Float   @default(0)
+  taxPaise       Int     @default(0)
+  totalPaise     Int
+  returnedQty    Float   @default(0)
+
+  returnItems PurchaseReturnItem[]
+
+  @@index([purchaseId])
+}
+
+model PurchasePayment {
+  id          String   @id @default(cuid())
+  purchaseId  String
+  purchase    Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  method      String
+  amountPaise Int
+  reference   String?
+  createdAt   DateTime @default(now())
+
+  @@index([purchaseId])
+}
+
+model SupplierPayment {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  supplierId    String
+  supplier      Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  amountPaise   Int
+  method        String   @default("CASH")
+  reference     String?
+  note          String?
+  purchaseId    String?
+  balanceAfterPaise Int  @default(0)
+  userId        String?
+  createdAt     DateTime @default(now())
+
+  @@index([businessId, supplierId])
+}
+
+model PurchaseReturn {
+  id           String   @id @default(cuid())
+  businessId   String
+  business     Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  purchaseId   String?
+  purchase     Purchase? @relation(fields: [purchaseId], references: [id])
+  supplierId   String?
+  supplier     Supplier? @relation(fields: [supplierId], references: [id])
+  returnNumber String
+  reason       String
+  totalPaise   Int      @default(0)
+  settlement   String   @default("ADJUST_DUE") // ADJUST_DUE | CASH_REFUND
+  userId       String?
+  createdAt    DateTime @default(now())
+
+  items PurchaseReturnItem[]
+
+  @@unique([businessId, returnNumber])
+  @@index([businessId, createdAt])
+}
+
+model PurchaseReturnItem {
+  id             String  @id @default(cuid())
+  returnId       String
+  purchaseReturn PurchaseReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  purchaseItemId String?
+  purchaseItem   PurchaseItem? @relation(fields: [purchaseItemId], references: [id])
+  variantId      String
+  variant        ProductVariant @relation(fields: [variantId], references: [id])
+  quantity       Float
+  unitCostPaise  Int
+  totalPaise     Int
+
+  @@index([returnId])
+}
+
+// ---------------------------------------------------------------------------
+// Money out / day close
+// ---------------------------------------------------------------------------
+
+model ExpenseCategory {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name       String
+  expenses   Expense[]
+
+  @@unique([businessId, name])
+}
+
+model Expense {
+  id          String   @id @default(cuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  categoryId  String?
+  category    ExpenseCategory? @relation(fields: [categoryId], references: [id])
+  amountPaise Int
+  method      String   @default("CASH")
+  description String?
+  expenseDate DateTime @default(now())
+  userId      String?
+  createdAt   DateTime @default(now())
+
+  @@index([businessId, expenseDate])
+}
+
+model DailyClosing {
+  id                String   @id @default(cuid())
+  businessId        String
+  business          Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  closingDate       DateTime
+  salesPaise        Int      @default(0)
+  cashPaise         Int      @default(0)
+  upiPaise          Int      @default(0)
+  cardPaise         Int      @default(0)
+  creditPaise       Int      @default(0)
+  otherPaise        Int      @default(0)
+  expensesPaise     Int      @default(0)
+  customerCollectionPaise Int @default(0)
+  expectedCashPaise Int      @default(0)
+  actualCashPaise   Int      @default(0)
+  differencePaise   Int      @default(0)
+  note              String?
+  userId            String?
+  user              User?    @relation(fields: [userId], references: [id])
+  createdAt         DateTime @default(now())
+
+  @@unique([businessId, closingDate])
+}
+
+// ---------------------------------------------------------------------------
+// Production (bakery / restaurant)
+// ---------------------------------------------------------------------------
+
+model Recipe {
+  id          String   @id @default(cuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  name        String
+  yieldQty    Float    @default(1)
+  /// Consume ingredients automatically when the finished product is sold.
+  autoConsumeOnSale Boolean @default(false)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  items       RecipeItem[]
+
+  @@index([businessId, productId])
+}
+
+model RecipeItem {
+  id         String  @id @default(cuid())
+  recipeId   String
+  recipe     Recipe  @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  variantId  String
+  variant    ProductVariant @relation(fields: [variantId], references: [id])
+  productId  String?
+  product    Product? @relation(fields: [productId], references: [id])
+  quantity   Float
+  note       String?
+
+  @@index([recipeId])
+}
+
+model Production {
+  id          String   @id @default(cuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  recipeId    String?
+  batchLabel  String?
+  quantity    Float
+  note        String?
+  userId      String?
+  createdAt   DateTime @default(now())
+  items       ProductionItem[]
+
+  @@index([businessId, createdAt])
+}
+
+model ProductionItem {
+  id           String  @id @default(cuid())
+  productionId String
+  production   Production @relation(fields: [productionId], references: [id], onDelete: Cascade)
+  variantId    String
+  variant      ProductVariant @relation(fields: [variantId], references: [id])
+  quantity     Float
+  role         String // OUTPUT | INGREDIENT
+
+  @@index([productionId])
+}
+
+model Wastage {
+  id          String   @id @default(cuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  variantId   String
+  variant     ProductVariant @relation(fields: [variantId], references: [id])
+  quantity    Float
+  reason      String
+  costPaise   Int      @default(0)
+  userId      String?
+  createdAt   DateTime @default(now())
+
+  @@index([businessId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Smart scanner (AI)
+// ---------------------------------------------------------------------------
+
+model ImageScan {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id])
+  /// Object-storage key. Raw image bytes never live in the database.
+  imageRef      String
+  imageHash     String?
+  mimeType      String   @default("image/jpeg")
+  sizeBytes     Int      @default(0)
+  scanType      String // INVOICE | PRODUCT | SHELF | STOCK_SHEET | RECEIPT
+  status        String   @default("UPLOADED") // UPLOADED | PROCESSING | EXTRACTED | REVIEW_REQUIRED | APPROVED | REJECTED | FAILED
+  failureReason String?
+  supplierId    String?
+  supplier      Supplier? @relation(fields: [supplierId], references: [id])
+  extractedSupplierName String?
+  invoiceNumber String?
+  invoiceDate   DateTime?
+  overallConfidence Float @default(0)
+  provider      String   @default("heuristic")
+  /// Purchase/adjustment created after approval.
+  resultRefType String?
+  resultRefId   String?
+  createdAt     DateTime @default(now())
+  processedAt   DateTime?
+
+  items       ImageScanItem[]
+  results     ImageScanResult[]
+  approvals   ImageScanApproval[]
+  corrections ImageScanCorrection[]
+
+  @@index([businessId, status])
+  @@index([businessId, createdAt])
+  @@index([businessId, imageHash])
+}
+
+model ImageScanItem {
+  id                  String   @id @default(cuid())
+  scanId              String
+  scan                ImageScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  lineNumber          Int      @default(0)
+  extractedProductName String
+  extractedRaw        String?
+  barcode             String?
+  matchedVariantId    String?
+  matchedVariant      ProductVariant? @relation(fields: [matchedVariantId], references: [id])
+  matchMethod         String? // BARCODE | SKU | EXACT_NAME | NORMALIZED_NAME | FUZZY | NONE
+  matchScore          Float    @default(0)
+  /// JSON array of alternative candidates shown to the user.
+  matchCandidates     String   @default("[]")
+  quantity            Float?
+  unitHint            String?
+  purchasePricePaise  Int?
+  sellingPricePaise   Int?
+  mrpPaise            Int?
+  taxRate             Float?
+  batch               String?
+  expiry              DateTime?
+  confidence          Float    @default(0)
+  /// JSON map<field, confidence>
+  fieldConfidence     String   @default("{}")
+  reviewState         String   @default("PENDING") // PENDING | ACCEPTED | REJECTED | NEEDS_INPUT
+  userCorrected       Boolean  @default(false)
+  createNewProduct    Boolean  @default(false)
+  createdAt           DateTime @default(now())
+
+  @@index([scanId])
+}
+
+/// Raw provider output kept verbatim for traceability/debugging.
+model ImageScanResult {
+  id         String   @id @default(cuid())
+  scanId     String
+  scan       ImageScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  stage      String // QUALITY | OCR | BARCODE | VISION | VALIDATION | MATCHING
+  provider   String
+  payload    String // JSON
+  durationMs Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  @@index([scanId, stage])
+}
+
+model ImageScanCorrection {
+  id          String   @id @default(cuid())
+  scanId      String
+  scan        ImageScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  scanItemId  String?
+  field       String
+  originalValue String?
+  correctedValue String?
+  userId      String?
+  createdAt   DateTime @default(now())
+
+  @@index([scanId])
+}
+
+model ImageScanApproval {
+  id             String   @id @default(cuid())
+  scanId         String
+  scan           ImageScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  approvedById   String
+  approvedBy     User     @relation(fields: [approvedById], references: [id])
+  approvedAt     DateTime @default(now())
+  approvedItems  Int      @default(0)
+  rejectedItems  Int      @default(0)
+  /// JSON snapshot of exactly what was confirmed.
+  snapshot       String   @default("{}")
+
+  @@index([scanId])
+}
+
+// ---------------------------------------------------------------------------
+// Platform services
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  type       String // LOW_STOCK | OUT_OF_STOCK | EXPIRY | CUSTOMER_DUE | SUPPLIER_DUE | SCAN_REVIEW
+  title      String
+  body       String
+  severity   String   @default("INFO") // INFO | WARNING | CRITICAL
+  refType    String?
+  refId      String?
+  /// Stable key so the same alert is not raised twice.
+  dedupeKey  String
+  isRead     Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@unique([businessId, dedupeKey])
+  @@index([businessId, isRead])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String // PRODUCT_PRICE_CHANGE | STOCK_ADJUSTMENT | SALE_CANCELLED | AI_SCAN_APPROVED ...
+  entityType String
+  entityId   String?
+  /// JSON before/after snapshots. AI actions also record image id, extraction,
+  /// confidence, user corrections and final confirmed values.
+  before     String?
+  after      String?
+  meta       String?
+  source     String   @default("MANUAL")
+  createdAt  DateTime @default(now())
+
+  @@index([businessId, createdAt])
+  @@index([businessId, entityType, entityId])
+}
+
+model DocumentSequence {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  key        String // INVOICE | SALES_RETURN | PURCHASE_RETURN
+  prefix     String   @default("")
+  nextValue  Int      @default(1)
+
+  @@unique([businessId, key])
+}
+
+/// Makes offline replay safe: the same client request id always returns the
+/// original response instead of creating a duplicate transaction.
+model IdempotencyKey {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  key        String
+  endpoint   String
+  responseJson String
+  entityType String?
+  entityId   String?
+  createdAt  DateTime @default(now())
+
+  @@unique([businessId, key])
+  @@index([businessId, createdAt])
+}
